@@ -1,0 +1,734 @@
+
+extensions [ nw ]
+
+undirected-link-breed [ roads road ]
+
+roads-own [ dist node1 node2 ]
+
+
+buses-own [
+  ; Static, read-only variables. These values never change. You can read them, but you cannot change them.
+  bus_id          ; The ID of a given agent (bus). Each agent has a unique ID.
+  bus_type        ; The type of a given agent (bus). 1 means "small", 2 means "medium" and 3 means "large".
+
+  ; Dynamic, read-only variables. These values may change over time. You can read them, but you cannot change them.
+  inbox           ; List containing all the incoming messages (a given message is a list like this [tick sender message]).
+  bus_passengers  ; List containing all the passengers that the agent (bus) is currently carrying (represented as a list like this [passenger_id bus_stop]).
+  previous_stop   ; ID of the last bus stop that the agent (bus) visited (-1 means that the agent has not visited any bus stop yet).
+  current_stop    ; ID of the bus stop where the agent (bus) currently is (-1 means that the agent is not at any bus stop).
+  next_stop       ; ID of the bus stop the agent (bus) is traveling to (-1 means that the agent is not travelling to any bus stop).
+
+  ; New local variables for students.
+  ; You can create any new local variable you want. Just declare them here.
+  my_route  ; the route of a bus: a list of bus stops
+  my_route_pointer  ; the index of the current stop in my_route
+  my_next_stop  ; the next bus stop in the route
+  has_started  ; true if the bus has found its initial stop and started serving passengers
+  has_route ; false until it has been assigned a route
+  all_routes  ; the list of default bus routes
+  bus_capacity  ; the maximum number of passengers a bus can carry at once
+  message_tick  ; tick at which messages were last read
+  beliefs  ; info about other busses
+
+  route-protocol ; "auctions" or "elections" or "all"?
+
+  ; parameters for deviations
+  param_alpha 
+  param_beta 
+  
+  ; parameters for voting
+  vote_count_frequency  ; how often votes are processed
+  vote_threshold ; minimum number of votes required to add a bus
+  vote_bus_size ; the size of the bus added (for elections)
+  
+  ; parameters for auctions
+  auction_frequency  ; how often buses bid
+  auction_bus_size ; the size of the bus added (for auctions)
+  my_penalty  ; increases for each passenger a bus cannot pick up
+  minimal_bid  ; the minimal offer for adding a bus to one's route
+
+  ]
+
+globals [graph]
+
+to init-buses
+  ; Agents are initialised here.
+  set bus_capacity (item bus_type [0 12 60 150]) ; 0-padding for indexing convenience (bus_types range from 1 to 3)
+
+  ; This list contains the topology of the entire network of bus stops, which is known to all agents. You can use this, for instance, to calculate the shortest path between two bus stops.
+  set graph [[22 15 14] [11 19 23 7] [8] [16 4 20 9] [3 5 10] [4 16 10 17] [8] [1 17 13] [2 6 9] [3 8 20] [4 5 17 13 21] [1 16 17] [20 15 22] [7 10 22 23] [0 23] [0 12 18] [3 5 11] [5 7 10 11] [15] [1 23] [3 9 12 21] [10 20 22] [0 12 13 21] [1 13 14 19]]
+
+  ;;; START Code block to create the graph structure for computing shortest-paths, etc
+  ; compute euclidean distances between connected nodes and store them into roads
+  let n1 0
+  foreach graph [
+    let xcor1 0
+    let ycor1 0
+    ask bus_stop n1 [
+        set xcor1 xcor
+        set ycor1 ycor
+    ]
+    foreach ? [
+      ask bus_stop ? [
+        let eucl_dist sqrt (((xcor1 - xcor) ^ 2) + ((ycor1 - ycor) ^ 2))
+        create-road-with bus_stop n1 [
+          set dist eucl_dist
+          set node1 n1
+          set node2 ?
+        ]
+      ]
+    ]
+    set n1 n1 + 1
+  ]
+
+  ; fixed routes
+  set all_routes [ [6  8  9  3  16  11  1  23] [6  8  9  20  21  10  17  7] [6  8  9  3  16  11  1  19] [2  8  9  3  16  11  1  23] [6  8  9  20  21  22  0  14] [2  8  9  3  16  11  1  19] [2  8  9  20  21  10  17  7] [2  8  9  20  21  22  0  14] [11  1  23  14  0  15  18] [5  10  21  22  0  15  18] [6  8  9  20  12  15  18] [6  8  9  20  21  10  13] [2  8  9  20  21  10  13] [2  8  9  20  12  15  18] [17  10  21  22  0  15  18] [7  13  22  0  15  18] [16  3  20  12  15  18] [18  15  0  14  23  19] [4  3  20  12  15  18] [3  16  11  1  23  14] [10  13  22  0  15  18] [0  14  23  1  11  16] [5  4  3  9  8  6] [19  23  13  10  21  20] [2  8  9  3  4  5] [3  4  10  17  7] [0  22  21  20  3] [4  10  13  23  19] [4  10  13  23  14] [5  17  7  1  19] [12  22  13  23  19] [0  22  21  10  4] [5  10  21  20  12] [1  23  13  10  4] [1  23  13  22  12] [5  10  13  23  14] [11  16  3  20  12] [16  5  10  13  22] [12  20  21  10  17] [1  11  16  3  20] [14  23  13  10  17] [11  1  23  13  22] [1  23  13  10  21] [3  4  10  13] [7  17  5  16] [7  1  23  14] [7  13  22  12] [11  17  10  13] [12  22  0  14] [4  10  17  11] [16  5  10  21] [11  17  10  21] [4  5  16] [7  17  11] [5  17  11] [2  8  6] ]
+
+  ;;; END code block
+
+  set beliefs []
+  foreach all_routes [ set beliefs fput [] beliefs ]
+
+  ; Assign routes to buses
+  ifelse (bus_id - length all_routes - 24) < 0 [
+    set my_route item (bus_id - 24) all_routes  ; -24 because the first bus id is 24
+    set my_route_pointer 0
+    set has_route true
+    set beliefs replace-item (bus_id - 24) beliefs (list bus_id (list xcor ycor) previous_stop my_next_stop bus_capacity)
+  ][
+    set has_route false
+    request-init
+  ]
+
+  ; The bus is not available yet to passengers. First, it needs to reach the starting station.
+  set has_started false
+  
+  ; Set message_tick to 0
+  set message_tick 0
+  
+  ; Params for deviations
+  set param_alpha 0.04
+  set param_beta 0.8
+  ; End Params for deviations
+  
+  ; Params for voting
+  set vote_count_frequency 15
+  set vote_threshold 10
+  set vote_bus_size 3
+  ; End Params for voting
+  
+  ; Params for auctions
+  set auction_frequency 20
+  set minimal_bid 20
+  set auction_bus_size 3
+  ; End Params for auctions
+
+
+  ; "auctions" or "elections" or "all"?
+  set route-protocol "all"
+end
+
+; Add a bus for each defined route. This is called only once at the beginning
+to add-new-buses
+  foreach but-first all_routes [
+    add-bus 3
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Network / Road Utility Functions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Compute distance between two bus stops
+to-report compute-distance [bus_stop_id1 bus_stop_id2]
+  let d 0
+  ask bus_stop bus_stop_id1 [
+    nw:set-context bus_stops roads
+    set d nw:weighted-distance-to bus_stop bus_stop_id2 "dist"
+  ]
+  report d
+end
+
+; Compute shortest-path between two bus stops
+to-report compute-shortest-path [bus_stop_id1 bus_stop_id2]
+  let path []
+  let prev bus_stop_id1
+  ; add first node to path
+  set path lput bus_stop_id1 path
+  ask bus_stop bus_stop_id1 [
+    nw:set-context bus_stops roads
+    let path_temp nw:weighted-path-to bus_stop bus_stop_id2 "dist"
+    foreach path_temp [
+      ask ? [
+        ifelse prev = node1 [
+          ; if the previous stop is node1, add node2
+          set path lput (node2) path
+          set prev node2
+        ] [
+          ; if the previous stop is node2, add node1
+          set path lput (node1) path
+          set prev node1
+        ]
+      ]
+    ]
+  ]
+  report path
+end
+
+; Check if two bus stops are adjacent
+to-report is-stop-adjacent? [bus_stop_id1 bus_stop_id2]
+  let linked false
+  ask bus_stop bus_stop_id1 [
+    let path nw:path-to bus_stop bus_stop_id2
+    if length path = 1 [
+      set linked true
+    ]
+  ]
+
+  report linked
+end
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Communication ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;
+to communicate
+  ; whether you are at a stop or not, always process incoming messages!
+  process-incoming-messages
+
+  ; when a bus reaches a bus stop (or at the beginning of the day)
+  if bus_id != 24 and ((current_stop != -1) or (ticks = 3)) [
+    ; it should push its state to the broadcaster (24)
+    send-message 24 inform
+  ]
+
+  if (bus_id = 24) and ((ticks mod 5) = 0) [
+    ; unless it is the broadcaster
+    let broadcast_msg broadcast
+
+    if not empty? broadcast_msg [
+      ;show (word "Broadcast: " broadcast_msg)
+
+      let bus_i 24
+      foreach beliefs [
+        if bus_i != 24 [ send-message bus_i broadcast_msg ]
+        set bus_i bus_i + 1
+      ]
+    ]
+  ]
+
+  if (ticks mod auction_frequency) = 0 [
+    if (my_penalty >= minimal_bid) [ bid (my_penalty) (length my_route) ]
+    set my_penalty 0
+  ]
+end
+
+; Send info to each bus about every other bus.
+to-report broadcast
+  let message []
+
+  let empty_beliefs filter [empty? ?] but-last beliefs
+
+  if length empty_beliefs = 0 [
+    set message fput "inform" message
+
+    let bus_i 24
+    foreach beliefs [
+      ifelse bus_i != 24 [
+        if length ? = 5 [
+          set message lput (item 0 ?) message ; bus_id
+          set message lput (item 1 ?) message ; coords
+          set message lput (item 2 ?) message ; previous_stop
+          set message lput (item 3 ?) message ; next_stop
+          set message lput (item 4 ?) message ; free_spots
+        ]
+      ][
+        ; info about broadcaster
+        set message lput bus_id message  ; bus_id
+        set message lput (list xcor ycor) message ; coords
+        set message lput previous_stop message ; previous_stop
+        set message lput my_next_stop message ; next_stop
+        set message lput (bus_capacity - length bus_passengers) message ; free_spots
+      ]
+      set bus_i bus_i + 1
+    ]
+  ]
+
+  ifelse empty? last beliefs [
+    ; new bus
+    set message lput (length beliefs - 1) message
+    set message lput 0 message
+    set message lput 0 message
+    set message lput 0 message
+    set message lput 0 message
+  ][
+    ; just the last bus
+    set message lput (item 0 last beliefs) message ; bus_id
+    set message lput (item 1 last beliefs) message ; coords
+    set message lput (item 2 last beliefs) message ; previous_stop
+    set message lput (item 3 last beliefs) message ; next_stop
+    set message lput (item 4 last beliefs) message ; free_spots
+  ]
+  report message
+end
+
+; Ask broadcaster for information necessary for agent initialisation
+to request-init
+  send-message 24 ["request-init"]
+end
+
+; Communicate the relevant information of a bus: position, previous and next stop and number of free seats.
+to-report inform
+  let coords list xcor ycor
+  let free_spots (bus_capacity - length bus_passengers)
+  let message list "inform" bus_id
+  set message lput coords message
+  set message lput previous_stop message
+  set message lput my_next_stop message
+  set message lput free_spots message
+  report message
+end
+
+; Broadcast updated routes to all buses
+to-report update-all-routes [new_all_routes]
+  let message (list "update-all-routes" new_all_routes)
+  report message
+end
+
+; Vote for a route between two stops
+to-report vote [begin_stop end_stop]
+  ; making sure order doesn't matter i.e (b1, b2) is the same as (b2, b1)
+  ; so enforce begin_stop < end_stop
+  if begin_stop > end_stop [
+    let temp end_stop
+    set end_stop begin_stop
+    set begin_stop temp
+  ]
+  let message (list "vote" begin_stop end_stop)
+  report message
+end
+
+; Place an offer for 'buying' a new bus to the bus route
+to bid [offer route_length]
+  let message (list "bid" bus_id offer route_length)
+  send-message 24 message
+end
+
+; Return true if the bus has not read this message yet.
+to-report is-unread [message]
+  ; Since the inbox cannot be 'emptied', we have to keep track of whether we've read the message or not
+  let t item 0 message
+  let m_type first (item 2 message)
+
+  let last_vote_tallying ticks - ( (ticks - 1) mod vote_count_frequency)
+  let last_auction ticks - ( (ticks - 2) mod auction_frequency)
+
+  let unread false
+
+  if (m_type = "vote") and (t > last_vote_tallying) [
+    set unread true
+  ]
+
+  if (m_type = "bid") and (t > last_auction) [
+    set unread true
+  ]
+
+  ; if t comes after the message_tick, it's unread
+  if (m_type != "vote") and (m_type != "bid") and (t > message_tick) [
+    set unread true
+  ]
+
+  report unread
+end
+
+; Read all new incoming messages and react according to the communication protocol.
+to process-incoming-messages
+  let unread-messages filter [is-unread ?] inbox
+
+  let votes [] ; a list of (stop_A stop_B) tuples
+  let election_day (ticks mod vote_count_frequency) = 0
+
+  let bids [] ; a list of (bus_id offer route_length) tuples
+  let auction_day ((ticks - 1) mod auction_frequency) = 0
+
+  foreach unread-messages [
+    let t item 0 ?
+    let sender item 1 ?
+    let message item 2 ?
+    let m_type item 0 message
+
+    ; handle messages - maybe a good idea to make routines for everything
+    if m_type = "request-init" [
+      ; if an agent has requested information, reply!
+      send-message sender update-all-routes all_routes
+      send-message sender broadcast
+    ]
+
+    if m_type = "update-all-routes" [
+      let new_all_r item 1 message
+      set all_routes new_all_r
+
+      while [length beliefs < length all_routes] [
+        set beliefs lput [] beliefs
+      ]
+
+      ; check if my route has been set
+      if not has_route = true [
+        set my_route last all_routes
+        show (word "Starting bus with route " my_route)
+        set has_route true
+      ]
+    ]
+
+    if (bus_id != 24) and (m_type = "inform") [
+      ; you have received a message containing info about all
+      ; other busses. update beliefs accordingly.
+
+      let msg but-first message
+
+      let idx 0
+      foreach all_routes [
+        ; when a new bus is added, the old message could be shorter than expected and cause IndexOutOfBounds
+        let chk 5 * idx + 5
+        if length msg > chk [
+          carefully [
+            set beliefs replace-item idx beliefs ( sublist msg (5 * idx) (5 * idx + 5) )
+          ] [
+          print error-message ; or do something else instead...
+          ]
+        ]
+        ; [5i, 5i+5] because each sub-message is 5 lines long
+        set idx idx + 1
+      ]
+    ]
+
+    if (bus_id = 24) and (m_type = "inform") [
+      ; you, the broadcaster, have received information about a single bus
+      ; update beliefs accordingly
+      set beliefs replace-item (sender - 24) beliefs (but-first message)
+    ]
+
+    if election_day and (m_type = "vote") [
+      ; at election day, add vote to list
+      set votes lput (but-first message) votes
+    ]
+
+    if auction_day and (m_type = "bid") [
+      ; at auction day, add bid to list
+      set bids lput (but-first message) bids
+    ]
+
+  ];end for-loop
+
+  if (bus_id = 24) and election_day and (route-protocol = "elections" or route-protocol = "all") [
+    process-votes votes
+  ]
+
+  if (bus_id = 24) and auction_day and (route-protocol = "auctions" or route-protocol = "all") [
+    process-bids bids
+  ]
+
+  ; done processing - update message_tick
+  set message_tick message_tick + 1
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; End  Communication ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Auctions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Read all offers and decide which bus has won the auction.
+to process-bids [bid_list]
+  let max_offer 0
+  let winner_bus_id 0
+  let winner_route_length 0  ; to resolve ties
+
+  foreach bid_list [
+    let b_id item 0 ?
+    let offer item 1 ?
+    let route_length item 2 ?
+
+    ; new highest bid
+    if offer > max_offer [
+      set winner_bus_id b_id
+      set max_offer offer
+      set winner_route_length route_length
+    ]
+
+    ; tie: solve it based on route length
+    if (offer = max_offer) and (route_length > winner_route_length) [
+      set winner_bus_id b_id
+      set winner_route_length route_length
+    ]
+  ]
+
+  if winner_bus_id != 0 [ add-route winner_bus_id ]
+end
+
+to add-route [route_id]
+
+  let new_route item (route_id - 24) all_routes
+
+  let all_r all_routes
+
+  ; update it with new route
+  set all_r lput new_route all_r
+
+  show(word "Auctions: Adding a new bus with route " new_route)
+
+  ; broadcast new routes to all buses
+  let i 0
+  foreach all_routes [
+    send-message 24 + i update-all-routes all_r
+    set i i + 1
+  ]
+  add-bus auction_bus_size
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Begin Voting Protocol ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+; tally votes for a given candidate
+to-report tally-vote-for [candidate vote_list]
+  let freq 0
+  foreach vote_list [
+    if candidate = ? [
+      set freq freq + 1
+    ]
+  ]
+  report freq
+end
+
+; Find out the best candidate and whether it 'deserves' a route
+to process-votes [vote_list]
+
+  let candidates remove-duplicates vote_list
+
+  let best_candidate 0
+  let best_candidate_freq -1
+  foreach candidates [
+    let freq tally-vote-for ? vote_list
+    if freq > best_candidate_freq [
+      set best_candidate ?
+      set best_candidate_freq freq
+    ]
+  ]
+
+  ifelse best_candidate_freq > vote_threshold [
+    let bs1 item 0 best_candidate
+    let bs2 item 1 best_candidate
+
+    let new_route compute-shortest-path bs1 bs2
+
+    ; what is the current all_routes?
+    let all_r all_routes
+
+    ; update it with new route
+    set all_r lput new_route all_r
+
+    show(word "Voting: Adding a new bus with route " new_route)
+
+    ; broadcast new routes to all buses
+    let i 0
+    foreach all_routes [
+      send-message 24 + i update-all-routes all_r
+      set i i + 1
+    ]
+    add-bus vote_bus_size
+  ] [
+    show(word "Not enough votes to add a bus: " best_candidate_freq ", " best_candidate)
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; End Voting Protocol ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+; Drop off all passengers at their destinations
+to drop-off
+  if not empty? bus_passengers [
+      foreach bus_passengers [
+        let pass_id first ?
+        let bus_stop last ?
+        if bus_stop = current_stop [
+          drop-off-passenger pass_id
+        ]
+      ]
+  ]
+end
+
+; Pick up all passengers at the current stop.
+; Preconditions: (1) the passenger's destination is in the bus route
+;                (2) the bus is not full
+to pick-up
+    foreach get-passengers-at-stop current_stop [
+        let pass_id first ?
+        let bus_stop last ?
+
+        let current_stop_idx ( position current_stop my_route )
+        let stops_to_destination ( sublist my_route (my_route_pointer + 1) (length my_route)  )
+
+        ; Only pick up a passenger (1) if he is travelling to a destination that is served by this bus
+        ; and (2) if the number of passenger does not exceed the maximum capacity.
+        if (member? bus_stop stops_to_destination) and ((length bus_passengers) < bus_capacity) [
+          pick-up-passenger first ?
+          ;show (word "pick up " pass_id)
+        ]
+
+        ; If bus is full and cannot pick up passenger, then it votes for a new route
+        ; (the passenger's destination must be in this bus's next stops. Otherwise a bus could vote
+        ; for routes that are in fact covered by other buses)
+        if (member? bus_stop stops_to_destination) and ((length bus_passengers) >= bus_capacity) [
+          send-message 24 ( vote current_stop bus_stop )
+          set my_penalty my_penalty + 1
+        ]
+    ]
+end
+
+
+; Procedure to reach the starting stop of the route of this bus
+to-report select-next-stop [starting_stop linked_stops]
+  let next_stop_id -1
+  ifelse member? starting_stop linked_stops [
+    set next_stop_id starting_stop
+  ][
+    let reachable_stops filter [get-distance ? starting_stop >= 0] linked_stops
+    ifelse empty? reachable_stops [
+      set next_stop_id first shuffle linked_stops
+    ][
+      set next_stop_id first ( sort-by [get-distance ?1 starting_stop < get-distance ?2 starting_stop] reachable_stops )
+    ]
+  ]
+  report next_stop_id
+end
+
+; GO
+to execute-actions
+  
+  ; communication protocol
+  communicate
+
+  ; Add decision making strategies for your agents here.
+  ; You are allowed to use the global variable 'ticks'.
+
+  if ticks = 2 [ add-new-buses ]
+
+
+  ifelse has_route = true [
+    ; The bus is not available yet for passengers. First, it needs to reach the starting station.
+    ifelse not has_started [
+      if (current_stop = first my_route) [
+        set has_started true  ; starting station found
+        stop
+      ]
+
+      ifelse (current_stop = -1) [
+        travel-to my_next_stop
+      ][
+        let linked_stops item current_stop graph
+        let starting_stop first my_route
+        set my_next_stop ( select-next-stop starting_stop linked_stops )
+        travel-to my_next_stop
+      ]
+    ]
+    ; The bus is now available for passengers
+    [
+      ifelse current_stop = -1 [
+        travel-to my_next_stop
+      ]
+      ; if bus is at stop
+      [
+        drop-off
+        pick-up
+
+        set my_next_stop item (my_route_pointer + 1) my_route
+
+        if (member? current_stop my_route) and (ticks > 40) [
+          let current_max 0
+          let deviate_flag false
+
+          foreach item current_stop graph [
+            let deviation_stop ?
+            let marginal_utility (compute-marginal-utility deviation_stop param_alpha param_beta)
+
+            if (marginal_utility > current_max) [
+              set current_max marginal_utility
+              set my_next_stop deviation_stop
+              set deviate_flag true
+            ]
+          ]
+          if not deviate_flag [ set my_route_pointer my_route_pointer + 1 ]
+          ; else: do nothing (pointer is already up-to-date)
+        ]
+
+        ; If the final destination is reached, start again inverting the bus direction.
+        if my_next_stop = last my_route [
+          set my_route reverse my_route
+          set my_route_pointer 0
+        ]
+        travel-to my_next_stop
+      ]
+    ]
+  ] ;
+  [
+    show("Bus is still waiting for a route")
+  ]
+end
+
+
+to-report compute-marginal-utility [deviation_stop alpha beta]
+  let num_passengers_inside length bus_passengers
+
+  let capacity_indicator 0
+  if (num_passengers_inside) < (bus_capacity * alpha) [
+    set capacity_indicator 1
+  ]
+
+  let viability_indicator 0
+  if (is-stop-adjacent? current_stop deviation_stop) and (is-stop-adjacent? deviation_stop my_next_stop) [
+    set viability_indicator 1
+  ]
+
+  let net_passengers_to_pick num_relevant_passengers_at_stop deviation_stop
+
+  ; distance of original path
+  let original_dist compute-distance current_stop my_next_stop
+  let current_to_deviation_dist compute-distance current_stop deviation_stop
+  let deviation_to_next_dist compute-distance deviation_stop my_next_stop
+
+  ; Compute how much additional distance we have to travel
+  let additional_travel_distance current_to_deviation_dist + deviation_to_next_dist - original_dist
+  ; let passengers_at_next get-passenger-at-stop my_next_stop
+  let U (capacity_indicator * viability_indicator * net_passengers_to_pick) - (additional_travel_distance * beta)
+  report U
+end
+
+; Return the number of passengers this bus can pick up from a bus stop.
+to-report num_relevant_passengers_at_stop [stop_id]
+  let pass_at_stop get-passengers-at-stop stop_id
+  let relevant_passengers 0
+
+  ; if bus.next is deviation then consider this bus
+
+  ; filter out empty beliefs that might be there immediately after the creation of a new bus
+  let non_empty_beliefs filter [not empty? ?] beliefs
+  let buses_in_vicinity filter [(item 3 ?) = stop_id] non_empty_beliefs
+
+  foreach pass_at_stop [
+    let p_goal last ?
+    let relevant_passenger true
+
+    foreach buses_in_vicinity [
+      let b_id first ?
+
+      if member? p_goal (item (b_id - 24) all_routes) [
+        set relevant_passenger false
+      ]
+    ]
+
+    if relevant_passenger and (member? p_goal my_route) [
+      set relevant_passengers relevant_passengers + 1
+    ]
+  ]
+  report relevant_passengers
+end
